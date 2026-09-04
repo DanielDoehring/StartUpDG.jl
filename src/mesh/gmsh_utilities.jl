@@ -71,6 +71,75 @@ function remap_element_grouping(eg::Vector{Int})
 end
 
 """
+    parse_physical_names(lines::Vector{String})
+ 
+Extract physical name -> tag mapping from MSH 2.2 file.
+Returns: Dict{String, Int} mapping names to physical tags
+"""
+function parse_physical_names(lines::Vector{String})
+    physical_names = Dict{String, Int}()
+    
+    idx = findline("\$PhysicalNames", lines)
+    if idx == 0
+        return physical_names # No physical names defined
+    end
+    
+    n_physical = parse(Int64, lines[idx + 1])
+    for i in 1:n_physical
+        parts = split(lines[idx + 1 + i])
+        dim = parse(Int64, parts[1])
+        tag = parse(Int64, parts[2])
+        name = strip(parts[3], ['"'])
+        physical_names[name] = tag
+    end
+    
+    return physical_names
+end
+
+"""
+    build_edges_dict(edge_list::Vector, physical_names::Dict)
+ 
+Build a dictionary mapping physical tag names to edge information.
+ 
+Returns: Dict{Symbol, Dict} with structure:
+  :boundary_name => Dict(:tag => Int, :edges => Vector{Tuple}, :nodes => Vector{Int})
+"""
+function build_edges_dict(edge_list::Vector, physical_names::Dict)
+    edges_dict = Dict{Symbol, Dict}()
+    
+    # Invert physical_names to get tag -> name mapping
+    tag_to_name = Dict(v => k for (k, v) in physical_names)
+    
+    # Group edges by physical tag
+    edges_by_tag = Dict{Int64, Vector{Tuple{Int64, Int64}}}()
+    for (n1, n2, tag) in edge_list
+        if !haskey(edges_by_tag, tag)
+            edges_by_tag[tag] = Tuple{Int64, Int64}[]
+        end
+        push!(edges_by_tag[tag], (n1, n2))
+    end
+    
+    # Build result dictionary
+    for (tag, edges) in edges_by_tag
+        name = get(tag_to_name, tag, "boundary_$tag")
+        name_sym = Symbol(name)
+        
+        # Collect all unique nodes on this boundary
+        nodes = unique(vcat(first.(edges), last.(edges)))
+        sort!(nodes)
+        
+        edges_dict[name_sym] = Dict(
+            :tag => tag,
+            :edges => edges,
+            :nodes => nodes
+        )
+    end
+    
+    return edges_dict
+end
+
+
+"""
     function read_Gmsh_2D_v4(filename, options)
 
 reads triangular GMSH 2D .msh files.
@@ -273,9 +342,12 @@ function read_Gmsh_2D_v4(filename::String, groupOpt::Bool = false,
 end
 
 """
-    read_Gmsh_2D_v2(filename)
+    read_Gmsh_2D_v2(filename::String)
 
-Reads triangular GMSH 2D file format 2.2 0 8. Returns (VX, VY), EToV.
+Reads triangular GMSH 2D file format 2.2 0 8.
+Returns: (VX, VY), EToV, edges_dict
+where edges_dict maps physical_tag_names to edge connectivity and node lists.
+
 # Examples
 ```julia
 VXY, EToV = read_Gmsh_2D_v2("eulerSquareCylinder2D.msh")
@@ -286,43 +358,73 @@ https://gmsh.info/doc/texinfo/gmsh.html#MSH-file-format-version-2-_0028Legacy_00
 function read_Gmsh_2D_v2(filename::String)
     f = open(filename)
     lines = readlines(f)
-
+    close(f)
+ 
+    # Parse format
     format_line = findline("\$MeshFormat", lines) + 1
     version, _, dataSize = split(lines[format_line])
     gmsh_version = parse(Float64, version)
     @assert gmsh_version == 2.2
-
+ 
+    # Parse physical names (to get name -> tag mapping)
+    physical_names = parse_physical_names(lines)
+ 
+    # Parse nodes
     node_start = findline("\$Nodes", lines) + 1
     Nv = parse(Int64, lines[node_start])
     VX, VY, VZ = ntuple(x -> zeros(Float64, Nv), 3)
     for i in 1:Nv
         vals = [parse(Float64, c) for c in split(lines[i + node_start])]
-        # first entry =
         VX[i] = vals[2]
         VY[i] = vals[3]
     end
-
+ 
+    # Parse elements and edges
     elem_start = findline("\$Elements", lines) + 1
     K_all = parse(Int64, lines[elem_start])
+    
+    # First pass: count triangular elements
     K = 0
     for e in 1:K_all
         if length(split(lines[e + elem_start])) == 8
             K = K + 1
         end
     end
+    K > 0 || error("No triangular elements found in mesh")
+ 
+    # Allocate arrays
     EToV = zeros(Int64, K, 3)
+    edge_list = Vector{Tuple{Int64, Int64, Int64}}() # (node1, node2, physical_tag)
+    
     sk = 1
     for e in 1:K_all
-        if length(split(lines[e + elem_start])) == 8
-            vals = [parse(Int64, c) for c in split(lines[e + elem_start])]
-            EToV[sk, :] .= vals[6:8]
+        # Gmsh 2.2 format: [elem_id, type, n_tags, tag1, tag2, ..., node1, node2]
+        fields = split(lines[e + elem_start])
+        el_type = parse(Int64, fields[2])
+        n_tags = parse(Int64, fields[3])
+
+        if el_type == 2 # Triangle
+            vals = [parse(Int64, c) for c in fields]
+            # offset of 3 due to elem_id, type, n_tags
+            node_indices = vals[3 + n_tags .+ (1:3)]
+            EToV[sk, :] .= node_indices
             sk = sk + 1
+        elseif el_type == 1 # Outer edge => boundary
+            vals = [parse(Int64, c) for c in fields]
+            physical_tag = vals[4] # `tag1` is physical tag (`tag2` is (geometric) entity tag)
+            node1 = vals[3 + n_tags + 1]
+            node2 = vals[3 + n_tags + 2]
+            push!(edge_list, (node1, node2, physical_tag))
         end
     end
-
+ 
+    # Correct negative Jacobians (for triangles)
     EToV = correct_negative_Jacobians!((VX, VY), EToV)
-
-    return (VX, VY), EToV
+ 
+    # Build edges dictionary indexed by physical tag name
+    edges_dict = build_edges_dict(edge_list, physical_names)
+ 
+    return (VX, VY), EToV, edges_dict
 end
 
 """
