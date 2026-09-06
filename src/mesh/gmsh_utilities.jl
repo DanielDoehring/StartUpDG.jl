@@ -102,10 +102,19 @@ end
 Build a dictionary mapping physical tag names to edge information.
  
 Returns: Dict{Symbol, Dict} with structure:
-  :boundary_name => Dict(:tag => Int, :edges => Vector{Tuple}, :nodes => Vector{Int})
+  :boundary_name => Dict(
+      :tag => Int,
+      :edges => Vector{Tuple},
+      :nodes => Vector{Int},
+      :midpoints => Vector{Tuple{Float64, Float64}},  # Edge midpoints
+      :n_edges => Int,
+      :n_nodes => Int
+  )
 """
-function build_edges_dict(edge_list::Vector, physical_names::Dict)
+function build_edges_dict(edge_list::Vector, physical_names::Dict, coords::Tuple)
     edges_dict = Dict{Symbol, Dict}()
+    
+    VX, VY = coords
     
     # Invert physical_names to get tag -> name mapping
     tag_to_name = Dict(v => k for (k, v) in physical_names)
@@ -128,15 +137,22 @@ function build_edges_dict(edge_list::Vector, physical_names::Dict)
         nodes = unique(vcat(first.(edges), last.(edges)))
         sort!(nodes)
         
+        # Compute edge midpoints
+        midpoints = [((VX[n1] + VX[n2])/2, (VY[n1] + VY[n2])/2) for (n1, n2) in edges]
+        
         edges_dict[name_sym] = Dict(
             :tag => tag,
             :edges => edges,
-            :nodes => nodes
+            :nodes => nodes,
+            :midpoints => midpoints,
+            :n_edges => length(edges),
+            :n_nodes => length(nodes)
         )
     end
     
     return edges_dict
 end
+
 
 
 """
@@ -422,7 +438,7 @@ function read_Gmsh_2D_v2(filename::String)
     EToV = correct_negative_Jacobians!((VX, VY), EToV)
  
     # Build edges dictionary indexed by physical tag name
-    edges_dict = build_edges_dict(edge_list, physical_names)
+    edges_dict = build_edges_dict(edge_list, physical_names, (VX, VY))
  
     return (VX, VY), EToV, edges_dict
 end
